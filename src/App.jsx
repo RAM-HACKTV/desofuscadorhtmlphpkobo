@@ -1,0 +1,805 @@
+import { useState, useRef, useEffect, useCallback, useMemo, lazy, Suspense } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
+import { toast } from 'sonner'
+import { RefreshCw } from 'react-feather'
+import { useI18n } from './i18n/I18nContext'
+import PreviewSkeleton from './components/PreviewSkeleton'
+import DelayedSuspense from './components/DelayedSuspense'
+import ErrorTestPage from './components/ErrorTestPage'
+import DarkModeTransition from './components/DarkModeTransition'
+import LanguageTransition from './components/LanguageTransition'
+import CustomLayoutEditor from './components/CustomLayoutEditor'
+
+// Lazy load icons
+const PlayIcon = lazy(() => import('react-feather').then(m => ({ default: m.Play })))
+const LoaderIcon = lazy(() => import('react-feather').then(m => ({ default: m.RefreshCw })))
+const SlidersIcon = lazy(() => import('react-feather').then(m => ({ default: m.Sliders })))
+
+// Lazy load các component lớn và Header
+const Header = lazy(() => import('./components/Header'))
+const Footer = lazy(() => import('./components/Footer'))
+const InputEditor = lazy(() => import('./components/InputEditor'))
+const Preview = lazy(() => import('./components/Preview'))
+const OutputEditor = lazy(() => import('./components/OutputEditor'))
+
+const SNAPSHOT_LIMIT = 10
+const DEFAULT_CUSTOM_SIZE = { width: 1200, height: 500 }
+
+const loadStoredCustomSize = () => {
+  try {
+    const saved = localStorage.getItem('custom-preview-size')
+    if (!saved) return DEFAULT_CUSTOM_SIZE
+    const parsed = JSON.parse(saved)
+    if (
+      parsed &&
+      typeof parsed.width === 'number' &&
+      typeof parsed.height === 'number' &&
+      parsed.width >= 200 &&
+      parsed.height >= 200
+    ) {
+      return parsed
+    }
+    return DEFAULT_CUSTOM_SIZE
+  } catch {
+    return DEFAULT_CUSTOM_SIZE
+  }
+}
+
+function App() {
+  const { t, language, changeLanguage, availableLanguages } = useI18n()
+  const [showErrorTest, setShowErrorTest] = useState(false)
+  const [isLanguageTransitioning, setIsLanguageTransitioning] = useState(false)
+  const [newLanguageCode, setNewLanguageCode] = useState(null)
+  const [html, setHtml] = useState(() => {
+    const saved = localStorage.getItem('html-editor-content')
+    return saved || ''
+  })
+  const [viewMode, setViewMode] = useState('desktop')
+  const initialCustomSize = loadStoredCustomSize()
+  const [customWidth, setCustomWidth] = useState(initialCustomSize.width)
+  const [customHeight, setCustomHeight] = useState(initialCustomSize.height)
+  const [fileName, setFileName] = useState(() => {
+    // Khôi phục tên file từ snapshot mới nhất (nếu có)
+    try {
+      if (typeof window === 'undefined') return null
+      const saved = localStorage.getItem('html-snapshots')
+      if (!saved) return null
+      const parsed = JSON.parse(saved)
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const latest = parsed[0]
+        if (latest && typeof latest.fileName === 'string' && latest.fileName.trim()) {
+          return latest.fileName.trim()
+        }
+      }
+      return null
+    } catch {
+      return null
+    }
+  })
+  const [showPreview, setShowPreview] = useState(false)
+  const [outputHtml, setOutputHtml] = useState('')
+  const [outputFileNameDisplay, setOutputFileNameDisplay] = useState('output_deobf.html')
+  const [previewHtml, setPreviewHtml] = useState('')
+  const [isProcessing, setIsProcessing] = useState(false)
+  const [isAutoProcessing, setIsAutoProcessing] = useState(false)
+  const [hasProcessed, setHasProcessed] = useState(false)
+  const [previewNonce, setPreviewNonce] = useState(0)
+  const [darkMode, setDarkMode] = useState(() => {
+    const saved = localStorage.getItem('dark-mode')
+    return saved ? saved === 'true' : false
+  })
+  const [isTransitioning, setIsTransitioning] = useState(false)
+  const [layoutMode, setLayoutMode] = useState(() => {
+    const saved = localStorage.getItem('layout-mode')
+    return saved || 'default'
+  })
+  const [customLayoutOrder, setCustomLayoutOrder] = useState(() => {
+    const saved = localStorage.getItem('custom-layout-order')
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved)
+        if (Array.isArray(parsed) && parsed.length === 3) {
+          return parsed
+        }
+      } catch (e) {
+        // Use default
+      }
+    }
+    return [
+      { id: 'input', name: 'Input', order: 0 },
+      { id: 'output', name: 'Output', order: 1 },
+      { id: 'preview', name: 'Preview', order: 2 }
+    ]
+  })
+  const [isCustomLayoutEditorOpen, setIsCustomLayoutEditorOpen] = useState(false)
+  const [autoPreview, setAutoPreview] = useState(() => {
+    const saved = localStorage.getItem('auto-preview')
+    return saved ? saved === 'true' : false
+  })
+  const [blockNetwork, setBlockNetwork] = useState(() => {
+    const saved = localStorage.getItem('block-network')
+    return saved ? saved === 'true' : true
+  })
+  const [debounceDelay, setDebounceDelay] = useState(() => {
+    const saved = localStorage.getItem('auto-preview-delay')
+    const parsed = saved ? parseInt(saved, 10) : 500
+    if (Number.isNaN(parsed)) return 500
+    return Math.min(5000, Math.max(300, parsed))
+  })
+  const [snapshots, setSnapshots] = useState(() => {
+    try {
+      const saved = localStorage.getItem('html-snapshots')
+      const parsed = saved ? JSON.parse(saved) : []
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  })
+  const [snapshotsSize, setSnapshotsSize] = useState(() => {
+    try {
+      const saved = localStorage.getItem('html-snapshots')
+      return saved ? new TextEncoder().encode(saved).length : 0
+    } catch {
+      return 0
+    }
+  })
+  const editorRef = useRef(null)
+  const outputEditorRef = useRef(null)
+  const [outputReadOnly, setOutputReadOnly] = useState(true)
+  const previewTimerRef = useRef(null)
+
+  // Auto-save to localStorage
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      localStorage.setItem('html-editor-content', html)
+    }, 500)
+    return () => clearTimeout(timer)
+  }, [html])
+
+  // Save dark mode preference
+  useEffect(() => {
+    localStorage.setItem('dark-mode', darkMode.toString())
+    if (darkMode) {
+      document.documentElement.classList.add('dark')
+    } else {
+      document.documentElement.classList.remove('dark')
+    }
+  }, [darkMode])
+
+  useEffect(() => {
+    localStorage.setItem('auto-preview', autoPreview.toString())
+  }, [autoPreview])
+
+  useEffect(() => {
+    localStorage.setItem('layout-mode', layoutMode)
+  }, [layoutMode])
+
+  const handleCustomLayoutSave = (newOrder) => {
+    setCustomLayoutOrder(newOrder)
+    setLayoutMode('custom')
+  }
+
+  const handleLayoutChange = (newLayout) => {
+    setLayoutMode(newLayout)
+  }
+
+  useEffect(() => {
+    localStorage.setItem('auto-preview-delay', debounceDelay.toString())
+  }, [debounceDelay])
+
+  useEffect(() => {
+    const clampedWidth = Math.min(3000, Math.max(200, customWidth))
+    const clampedHeight = Math.min(3000, Math.max(200, customHeight))
+    localStorage.setItem(
+      'custom-preview-size',
+      JSON.stringify({ width: clampedWidth, height: clampedHeight })
+    )
+  }, [customWidth, customHeight])
+
+  const toggleDarkMode = () => {
+    const newDarkMode = !darkMode
+    setIsTransitioning(true)
+    // Đổi theme ở 40-50% animation (0.3s trong tổng 0.7s)
+    setTimeout(() => {
+      setDarkMode(newDarkMode)
+    }, 650)
+    // Kết thúc animation sau 0.7s
+    setTimeout(() => {
+      setIsTransitioning(false)
+    }, 1300)
+  }
+
+  const handleLanguageChange = (newLangCode) => {
+    if (newLangCode === language) return
+    
+    // Set cả hai state cùng lúc để trigger animation
+    setNewLanguageCode(newLangCode)
+    setIsLanguageTransitioning(true)
+    
+    // Đổi ngôn ngữ ở 40-50% animation (0.3s trong tổng 0.7s)
+    setTimeout(() => {
+      changeLanguage(newLangCode)
+    }, 300)
+    
+    // Kết thúc animation sau 0.7s
+    setTimeout(() => {
+      setIsLanguageTransitioning(false)
+      // Đợi exit animation hoàn thành trước khi clear newLanguageCode
+      setTimeout(() => {
+        setNewLanguageCode(null)
+      }, 200)
+    }, 700)
+  }
+
+  useEffect(() => {
+    localStorage.setItem('block-network', blockNetwork.toString())
+    if (!blockNetwork) {
+      toast.warning(t('toast.networkUnblocked'))
+    }
+  }, [blockNetwork, t])
+
+  useEffect(() => {
+    try {
+      const payload = JSON.stringify(snapshots)
+      setSnapshotsSize(new TextEncoder().encode(payload).length)
+    } catch {
+      setSnapshotsSize(0)
+    }
+  }, [snapshots])
+
+  useEffect(() => {
+    const persistSnapshots = (list) => {
+      try {
+        localStorage.setItem('html-snapshots', JSON.stringify(list))
+        return true
+      } catch (error) {
+        return false
+      }
+    }
+
+    if (persistSnapshots(snapshots)) {
+      return
+    }
+
+    if (!snapshots.length) return
+
+    toast.warning(t('toast.snapshotStorageWarning'))
+
+    let trimmed = snapshots
+    while (trimmed.length > 0) {
+      trimmed = trimmed.slice(0, -1)
+      if (persistSnapshots(trimmed)) {
+        if (trimmed.length !== snapshots.length) {
+          setSnapshots(trimmed)
+        }
+        break
+      }
+    }
+  }, [snapshots, setSnapshots, t])
+
+  useEffect(() => {
+    return () => {
+      if (previewTimerRef.current) {
+        clearTimeout(previewTimerRef.current)
+      }
+    }
+  }, [])
+
+  const defaultInputFileName = useMemo(() => fileName || 'input.html', [fileName])
+
+  const saveSnapshot = useCallback((content) => {
+    const trimmed = (content || '').trim()
+    if (!trimmed) return
+    setSnapshots((prev) => {
+      if (prev.length && prev[0].content === content) {
+        return prev
+      }
+      const next = [
+        { id: Date.now(), content, timestamp: new Date().toISOString(), fileName: defaultInputFileName },
+        ...prev
+      ]
+      return next.slice(0, SNAPSHOT_LIMIT)
+    })
+  }, [defaultInputFileName])
+
+  const deriveBaseFileName = useCallback(() => {
+    if (fileName && typeof fileName === 'string') {
+      const trimmed = fileName.trim()
+      if (trimmed) {
+        const withoutExt = trimmed.replace(/\.[^/.]+$/, '')
+        return withoutExt || 'output'
+      }
+    }
+    return 'output'
+  }, [fileName])
+
+  const triggerPreview = useCallback(({ showToast = false, isAuto = false } = {}) => {
+    if (!html || html.trim() === '') {
+      if (showToast) {
+        toast.error(t('toast.processError'))
+      }
+      return false
+    }
+
+    const nextBase = deriveBaseFileName()
+    setOutputFileNameDisplay(`${nextBase}_deobf.html`)
+
+    setIsAutoProcessing(isAuto)
+    setPreviewHtml(html)
+    setPreviewNonce(prev => prev + 1)
+    setOutputHtml('')
+    setIsProcessing(true)
+    setShowPreview(true)
+    setHasProcessed(true)
+    saveSnapshot(html)
+
+    if (showToast) {
+      toast(t('toast.processing'), {
+        icon: <RefreshCw size={16} className="animate-spin" />
+      })
+    }
+    return true
+  }, [html, t, saveSnapshot, deriveBaseFileName])
+
+  const handleProcess = useCallback(() => {
+    triggerPreview({ showToast: true, isAuto: false })
+  }, [triggerPreview])
+
+  useEffect(() => {
+    if (!autoPreview) {
+      if (previewTimerRef.current) {
+        clearTimeout(previewTimerRef.current)
+        previewTimerRef.current = null
+      }
+      return
+    }
+
+    if (!html || html.trim() === '') {
+      if (previewTimerRef.current) {
+        clearTimeout(previewTimerRef.current)
+        previewTimerRef.current = null
+      }
+      return
+    }
+
+    if (previewTimerRef.current) {
+      clearTimeout(previewTimerRef.current)
+    }
+
+    previewTimerRef.current = setTimeout(() => {
+      triggerPreview({ showToast: false, isAuto: true })
+      previewTimerRef.current = null
+    }, debounceDelay)
+
+    return () => {
+      if (previewTimerRef.current) {
+        clearTimeout(previewTimerRef.current)
+        previewTimerRef.current = null
+      }
+    }
+  }, [html, autoPreview, triggerPreview, debounceDelay])
+
+  const handleQuickDownload = useCallback(() => {
+    if (!html || html.trim() === '') {
+      toast.error(t('toast.processError'))
+      return
+    }
+    const blob = new Blob([html], { type: 'text/html' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = fileName || 'input.html'
+    a.click()
+    URL.revokeObjectURL(url)
+    toast.success(t('toast.downloaded', { name: fileName || 'input.html' }))
+  }, [html, fileName, t])
+
+  useEffect(() => {
+    const handleKeydown = (event) => {
+      if (event.ctrlKey && event.key === 'Enter') {
+        event.preventDefault()
+        handleProcess()
+        return
+      }
+      if (event.ctrlKey && (event.key === 's' || event.key === 'S')) {
+        event.preventDefault()
+        handleQuickDownload()
+      }
+    }
+    window.addEventListener('keydown', handleKeydown)
+    return () => window.removeEventListener('keydown', handleKeydown)
+  }, [handleProcess, handleQuickDownload])
+
+  const handlePreviewLoad = (content) => {
+    if (!isProcessing) return
+    // Nếu không có data thì hiển thị message i18n
+    if (!content || content.trim() === '') {
+      setOutputHtml(t('output.noData'))
+    } else {
+      setOutputHtml(content)
+    }
+    setIsProcessing(false)
+    if (!isAutoProcessing) {
+      toast.success(t('toast.processSuccess'))
+    }
+  }
+
+  // Check if screen is desktop size (>= 1024px)
+  const [isDesktop, setIsDesktop] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return window.innerWidth >= 1024
+    }
+    return true
+  })
+
+  useEffect(() => {
+    const handleResize = () => {
+      setIsDesktop(window.innerWidth >= 1024)
+    }
+    window.addEventListener('resize', handleResize)
+    return () => window.removeEventListener('resize', handleResize)
+  }, [])
+
+  // Render layout content based on layout mode
+  const renderLayoutContent = () => {
+    // Force default layout on mobile/tablet
+    const effectiveLayoutMode = isDesktop ? layoutMode : 'default'
+    const processButtons = (
+      <motion.div
+        key="process"
+        className="flex flex-col lg:flex-row items-center justify-center gap-2 sm:gap-4 py-2 sm:py-4"
+        variants={itemVariants}
+      >
+        <motion.button
+          className="px-4 sm:px-6 py-2 sm:py-3 bg-bw-black text-bw-white border border-bw-black rounded-sm cursor-pointer text-xs sm:text-sm font-medium flex items-center gap-1.5 sm:gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+          onClick={handleProcess}
+          disabled={isProcessing || !html || html.trim() === ''}
+          whileHover={!isProcessing && html && html.trim() !== '' ? { backgroundColor: '#333333', borderColor: '#333333' } : {}}
+          whileTap={!isProcessing && html && html.trim() !== '' ? { scale: 0.95 } : {}}
+          transition={{ duration: 0.2 }}
+        >
+          <Suspense fallback={<div className="w-3.5 h-3.5 sm:w-4 sm:h-4" />}>
+            {isProcessing ? (
+              <LoaderIcon size={14} strokeWidth={2.5} className="sm:w-4 sm:h-4 animate-spin" />
+            ) : (
+              <PlayIcon size={14} strokeWidth={2} className="sm:w-4 sm:h-4" />
+            )}
+          </Suspense>
+          {isProcessing ? t('process.buttonProcessing') : t('process.button')}
+        </motion.button>
+        <div className="group flex flex-col items-center gap-1">
+          <motion.button
+            className={`flex items-center gap-2 px-3 sm:px-4 py-2 border rounded-sm text-xs sm:text-sm font-medium transition-colors ${
+              autoPreview
+                ? 'bg-bw-black text-bw-white border-bw-black'
+                : 'bg-bw-white text-bw-black border-bw-gray-d dark:bg-bw-gray-3 dark:text-bw-white dark:border-bw-gray-3'
+            }`}
+            onClick={() => setAutoPreview((prev) => !prev)}
+            whileTap={{ scale: 0.96 }}
+          >
+            <span className="relative inline-flex w-8 h-4 rounded-full border border-current transition-colors">
+              <span
+                className={`absolute top-[2px] w-3 h-3 rounded-full bg-current transition-transform ${
+                  autoPreview ? 'translate-x-[20px]' : 'translate-x-0'
+                }`}
+              />
+            </span>
+            <span>{t('process.autoToggle')}</span>
+          </motion.button>
+          <span className="text-[10px] uppercase tracking-wide text-bw-gray-6 dark:text-bw-gray-5">
+            {autoPreview ? t('process.autoOn') : t('process.autoOff')}
+          </span>
+        </div>
+        {autoPreview && (
+          <div className="flex flex-col items-center gap-1 text-[10px] sm:text-xs text-bw-gray-7 dark:text-bw-gray-7">
+            <div className="flex items-center gap-2">
+              <Suspense fallback={<div className="w-3 h-3" />}>
+                <SlidersIcon size={12} className="text-bw-gray-6 dark:text-bw-gray-5" />
+              </Suspense>
+              <input
+                type="range"
+                min="300"
+                max="5000"
+                step="50"
+                value={debounceDelay}
+                onChange={(e) => setDebounceDelay(Number(e.target.value))}
+                className="w-32 sm:w-40 accent-bw-black dark:accent-bw-white"
+              />
+            </div>
+            <span>{t('process.autoDelayLabel', { value: debounceDelay })}</span>
+          </div>
+        )}
+      </motion.div>
+    )
+
+    // InputEditor với Process Buttons - luôn đi kèm nhau
+    const inputEditorWithProcess = (
+      <div key="input-with-process" className="flex flex-col gap-3 sm:gap-4">
+        <DelayedSuspense fallback={<PreviewSkeleton />} delay={500}>
+          <InputEditor 
+            html={html}
+            setHtml={setHtml}
+            fileName={fileName}
+            setFileName={setFileName}
+            editorRef={editorRef}
+            darkMode={darkMode}
+            snapshots={snapshots}
+            setSnapshots={setSnapshots}
+            snapshotsSize={snapshotsSize}
+            onLoadUrl={async (url) => {
+              if (!url) return
+              try {
+                const response = await fetch(url)
+                if (!response.ok) {
+                  throw new Error('Failed to fetch')
+                }
+                const text = await response.text()
+                setHtml(text)
+                toast.success(t('toast.loadedFromUrl', { url }))
+              } catch (error) {
+                toast.error(t('toast.loadFromUrlError'))
+              }
+            }}
+            onLoadClipboard={async () => {
+              if (!navigator.clipboard || !navigator.clipboard.readText) {
+                toast.error(t('toast.clipboardUnsupported'))
+                return
+              }
+              try {
+                const text = await navigator.clipboard.readText()
+                if (!text) {
+                  toast.error(t('toast.clipboardEmpty'))
+                  return
+                }
+                setHtml(text)
+                toast.success(t('toast.loadedFromClipboard'))
+              } catch (error) {
+                toast.error(t('toast.clipboardReadError'))
+              }
+            }}
+          />
+        </DelayedSuspense>
+        {processButtons}
+      </div>
+    )
+
+    const outputEditor = (
+      <DelayedSuspense key="output" fallback={<PreviewSkeleton />} delay={500}>
+        <OutputEditor
+          outputHtml={outputHtml}
+          setOutputHtml={setOutputHtml}
+          outputEditorRef={outputEditorRef}
+          darkMode={darkMode}
+          isProcessing={isProcessing}
+          readOnly={outputReadOnly}
+          onReadOnlyChange={setOutputReadOnly}
+          notRunYet={!hasProcessed && !isProcessing && !outputHtml}
+          downloadFileName={outputFileNameDisplay}
+        />
+      </DelayedSuspense>
+    )
+
+    const preview = (
+      <DelayedSuspense key="preview" fallback={<PreviewSkeleton />} delay={500}>
+        <Preview
+          html={previewHtml}
+          reloadKey={previewNonce}
+          viewMode={viewMode}
+          setViewMode={setViewMode}
+          customWidth={customWidth}
+          setCustomWidth={setCustomWidth}
+          customHeight={customHeight}
+          setCustomHeight={setCustomHeight}
+          onLoad={handlePreviewLoad}
+          showPreview={showPreview}
+          darkMode={darkMode}
+          blockNetwork={blockNetwork}
+          setBlockNetwork={setBlockNetwork}
+          notRunYet={!hasProcessed && !isProcessing && !outputHtml}
+          fileName={outputFileNameDisplay}
+        />
+      </DelayedSuspense>
+    )
+
+    switch (effectiveLayoutMode) {
+      case 'horizontal':
+        return (
+          <>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4">
+              {inputEditorWithProcess}
+              {outputEditor}
+            </div>
+            {preview}
+          </>
+        )
+      case 'vertical-split':
+        return (
+          <>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4">
+              <div className="flex flex-col gap-3 sm:gap-4">
+                {inputEditorWithProcess}
+                {outputEditor}
+              </div>
+              <div className="flex flex-col gap-3 sm:gap-4">
+                {preview}
+              </div>
+            </div>
+          </>
+        )
+      case 'grid':
+        return (
+          <>
+            {inputEditorWithProcess}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4">
+              {outputEditor}
+              {preview}
+            </div>
+          </>
+        )
+      case 'custom':
+        // Render theo thứ tự đã lưu trong customLayoutOrder (grid 2D: sort by row then col)
+        const sortedItems = customLayoutOrder
+          .sort((a, b) => {
+            // Support both old format (order) and new format (row/col)
+            if (a.row !== undefined && b.row !== undefined) {
+              // New format: sort by row first, then col
+              if (a.row !== b.row) return a.row - b.row
+              return a.col - b.col
+            } else {
+              // Old format: sort by order
+              return (a.order || 0) - (b.order || 0)
+            }
+          })
+        
+        // Find max dimensions for grid
+        const maxRow = Math.max(...sortedItems.map(item => (item.row || 0) + (item.rowspan || 1) - 1), 0)
+        const maxCol = Math.max(...sortedItems.map(item => (item.col || 0) + (item.colspan || 1) - 1), 0)
+        const gridRows = maxRow + 1
+        const gridCols = Math.max(maxCol + 1, 3)
+        
+        const orderedComponents = sortedItems.map(item => {
+          const rowspan = item.rowspan || 1
+          const colspan = item.colspan || 1
+          const row = item.row !== undefined ? item.row : 0
+          const col = item.col !== undefined ? item.col : 0
+          
+          let component = null
+          switch (item.id) {
+            case 'input':
+              component = inputEditorWithProcess
+              break
+            case 'output':
+              component = outputEditor
+              break
+            case 'preview':
+              component = preview
+              break
+            default:
+              return null
+          }
+          
+          if (!component) return null
+          
+          return (
+            <div
+              key={item.id}
+              style={{
+                gridRow: `span ${rowspan}`,
+                gridColumn: `span ${colspan}`
+              }}
+            >
+              {component}
+            </div>
+          )
+        }).filter(Boolean)
+        
+        return (
+          <div 
+            className="grid gap-3 sm:gap-4"
+            style={{
+              gridTemplateRows: `repeat(${gridRows}, minmax(0, 1fr))`,
+              gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))`
+            }}
+          >
+            {orderedComponents}
+          </div>
+        )
+      default: // 'default'
+        return (
+          <>
+            {inputEditorWithProcess}
+            {outputEditor}
+            {preview}
+          </>
+        )
+    }
+  }
+
+
+  const containerVariants = {
+    hidden: { opacity: 0 },
+    visible: {
+      opacity: 1,
+      transition: {
+        staggerChildren: 0.1,
+        delayChildren: 0.1
+      }
+    }
+  }
+
+  const itemVariants = {
+    hidden: { opacity: 0, y: 20 },
+    visible: {
+      opacity: 1,
+      y: 0,
+      transition: {
+        duration: 0.4,
+        ease: [0.6, -0.05, 0.01, 0.99]
+      }
+    }
+  }
+
+  if (showErrorTest) {
+    return (
+      <ErrorTestPage onBack={() => setShowErrorTest(false)} />
+    )
+  }
+
+  return (
+    <motion.div 
+      className="min-h-screen flex flex-col bg-bw-white dark:bg-bw-gray-1"
+      initial="hidden"
+      animate="visible"
+      variants={containerVariants}
+    >
+      <Suspense fallback={<div className="h-16 bg-bw-black"></div>}>
+        <Header 
+          darkMode={darkMode} 
+          toggleDarkMode={toggleDarkMode}
+          onShowErrorTest={() => setShowErrorTest(true)}
+          onLanguageChange={handleLanguageChange}
+          layoutMode={layoutMode}
+          onLayoutChange={handleLayoutChange}
+          onEditCustomLayout={() => setIsCustomLayoutEditorOpen(true)}
+        />
+      </Suspense>
+      
+      <motion.div 
+        className="flex flex-col flex-1 gap-3 sm:gap-4 p-2 sm:p-4"
+        variants={containerVariants}
+      >
+        {renderLayoutContent()}
+      </motion.div>
+      
+      {/* Footer */}
+      <Suspense fallback={<div className="h-16 bg-bw-black"></div>}>
+        <Footer />
+      </Suspense>
+      
+      {/* Dark Mode Transition Overlay */}
+      <DarkModeTransition 
+        isTransitioning={isTransitioning} 
+        newDarkMode={!darkMode}
+      />
+      
+      {/* Language Transition Overlay */}
+      <LanguageTransition 
+        isTransitioning={isLanguageTransitioning} 
+        newLanguageCode={newLanguageCode}
+        availableLanguages={availableLanguages}
+      />
+
+      {/* Custom Layout Editor */}
+      <CustomLayoutEditor
+        isOpen={isCustomLayoutEditorOpen}
+        onClose={() => setIsCustomLayoutEditorOpen(false)}
+        onSave={handleCustomLayoutSave}
+        currentLayout={customLayoutOrder}
+      />
+    </motion.div>
+  )
+}
+
+export default App
+
+
